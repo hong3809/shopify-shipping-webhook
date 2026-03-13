@@ -1,10 +1,12 @@
 {
   "name": "shopify-shipping-webhook",
-  "version": "3.0.0",
+  "version": "4.0.0",
+  "description": "Shopify webhook server for HyperCape - AI description + Facebook ad image",
   "type": "module",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
