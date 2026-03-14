@@ -203,27 +203,109 @@ async function generateFacebookImageUrl(product) {
   }
 }
 
-// ─── Shopify: FB 이미지 URL을 metafield에 저장 ──────────
-async function saveFacebookImageUrl(productId, imageUrl) {
+// ─── DALL-E 이미지를 Shopify CDN에 영구 업로드 ──────────
+async function uploadImageToShopifyCDN(imageUrl, filename) {
   try {
-    const url = `https://${SHOPIFY_STORE}/admin/api/2024-01/products/${productId}/metafields.json`;
-    const res = await fetch(url, {
+    // 1. DALL-E URL에서 이미지 바이너리 다운로드
+    const imgRes = await fetch(imageUrl);
+    if (!imgRes.ok) throw new Error(`Image fetch failed: ${imgRes.status}`);
+    const buffer = await imgRes.buffer();
+    const base64 = buffer.toString('base64');
+
+    // 2. Shopify Product Images API로 업로드 (base64)
+    // product images 대신 files API 사용
+    const uploadUrl = `https://${SHOPIFY_STORE}/admin/api/2024-01/themes/147194871969/assets.json`;
+    // Shopify Files API (GraphQL)로 업로드
+    const graphqlUrl = `https://${SHOPIFY_STORE}/admin/api/2024-01/graphql.json`;
+    const mutation = `
+      mutation fileCreate($files: [FileCreateInput!]!) {
+        fileCreate(files: $files) {
+          files {
+            ... on MediaImage {
+              image { url }
+            }
+          }
+          userErrors { field message }
+        }
+      }
+    `;
+    const gqlRes = await fetch(graphqlUrl, {
       method: 'POST',
       headers: {
         'X-Shopify-Access-Token': SHOPIFY_TOKEN,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        metafield: {
-          namespace: 'marketing',
-          key: 'fb_ad_image_url',
-          value: imageUrl,
-          type: 'url'
+        query: mutation,
+        variables: {
+          files: [{
+            alt: 'FB Ad Image',
+            contentType: 'IMAGE',
+            originalSource: imageUrl
+          }]
         }
       })
     });
+    const gqlData = await gqlRes.json();
+    const cdnUrl = gqlData?.data?.fileCreate?.files?.[0]?.image?.url;
+    if (cdnUrl) {
+      console.log(`[FB Image] ✅ Uploaded to Shopify CDN: ${cdnUrl.substring(0, 60)}...`);
+      return cdnUrl;
+    }
+    // GraphQL 실패 시 원본 URL 반환
+    console.warn('[FB Image] CDN upload failed, using original URL');
+    return imageUrl;
+  } catch (err) {
+    console.error('[FB Image] CDN upload error:', err.message);
+    return imageUrl; // 실패해도 원본 URL 저장
+  }
+}
+
+// ─── Shopify: FB 이미지 URL을 metafield에 저장 ──────────
+async function saveFacebookImageUrl(productId, imageUrl) {
+  try {
+    // DALL-E 임시 URL → Shopify CDN 영구 URL로 변환
+    console.log(`[FB Image] Uploading to Shopify CDN...`);
+    const permanentUrl = await uploadImageToShopifyCDN(imageUrl, `fb_ad_${productId}.png`);
+
+    // 기존 메타필드 확인 (중복 생성 방지)
+    const listUrl = `https://${SHOPIFY_STORE}/admin/api/2024-01/products/${productId}/metafields.json`;
+    const listRes = await fetch(listUrl, {
+      headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN }
+    });
+    const listData = await listRes.json();
+    const existing = listData.metafields?.find(m => m.key === 'fb_ad_image_url');
+
+    let url, method, body;
+    if (existing) {
+      // 기존 메타필드 업데이트
+      url = `https://${SHOPIFY_STORE}/admin/api/2024-01/metafields/${existing.id}.json`;
+      method = 'PUT';
+      body = JSON.stringify({ metafield: { id: existing.id, value: permanentUrl } });
+    } else {
+      // 새 메타필드 생성
+      url = listUrl;
+      method = 'POST';
+      body = JSON.stringify({
+        metafield: {
+          namespace: 'marketing',
+          key: 'fb_ad_image_url',
+          value: permanentUrl,
+          type: 'url'
+        }
+      });
+    }
+
+    const res = await fetch(url, {
+      method,
+      headers: {
+        'X-Shopify-Access-Token': SHOPIFY_TOKEN,
+        'Content-Type': 'application/json'
+      },
+      body
+    });
     if (res.ok) {
-      console.log(`[FB Image] ✅ URL saved to metafield: product ${productId}`);
+      console.log(`[FB Image] ✅ Permanent URL saved to metafield: product ${productId}`);
       return true;
     }
     console.error('[FB Image] Metafield save failed:', (await res.text()).substring(0, 200));
