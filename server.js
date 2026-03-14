@@ -378,6 +378,102 @@ async function processProduct(product) {
   console.log(`[Process] ✅ Done: ${title}\n`);
 }
 
+// ─── Facebook/Instagram 카탈로그 피드 생성 ──────────────
+async function buildFacebookCatalogFeed() {
+  // Shopify에서 전체 활성 제품 가져오기 (Shipping Fee 제외)
+  const r = await fetch(
+    `https://${SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=250&status=active`,
+    { headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN } }
+  );
+  const { products } = await r.json();
+
+  // 각 제품의 FB 이미지 metafield 가져오기
+  const metaMap = {};
+  for (const p of products) {
+    if (p.tags?.includes('shipping-fee-hidden')) continue;
+    try {
+      const mr = await fetch(
+        `https://${SHOPIFY_STORE}/admin/api/2024-01/products/${p.id}/metafields.json`,
+        { headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN } }
+      );
+      const md = await mr.json();
+      const fbMeta = md.metafields?.find(m => m.key === 'fb_ad_image_url');
+      if (fbMeta?.value) metaMap[p.id] = fbMeta.value;
+    } catch {}
+  }
+
+  const storeUrl = `https://${SHOPIFY_STORE.replace('.myshopify.com', '')}.com`;
+
+  // XML 피드 생성 (Meta Commerce / Google Merchant 호환)
+  let xml = `<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
+  <channel>
+    <title>Sojudad K-Beauty Store</title>
+    <link>${storeUrl}</link>
+    <description>K-Beauty and K-Pop products catalog</description>
+`;
+
+  for (const p of products) {
+    // Shipping Fee 제품 제외
+    if (p.tags?.includes('shipping-fee-hidden') || p.handle === 'shipping-fee') continue;
+
+    const desc = (p.body_html || '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().substring(0, 5000);
+    const fbImageUrl = metaMap[p.id];
+
+    for (const v of p.variants) {
+      const productUrl = `https://sojudad.com/products/${p.handle}`;
+      const mainImage = p.images?.[0]?.src || '';
+      const adImage = fbImageUrl || mainImage;
+
+      // 재고 상태 판단
+      const inStock = v.inventory_policy === 'continue' || (v.inventory_quantity ?? 0) > 0;
+      const availability = inStock ? 'in stock' : 'out of stock';
+
+      // 브랜드 / 카테고리
+      const brand = p.vendor || 'Korean Brand';
+      const category = detectCategory(p);
+      const googleCategory = category === 'kpop'
+        ? 'Media > Music > Music CDs & LPs'
+        : 'Health & Beauty > Personal Care > Cosmetics';
+
+      // variant title이 'Default Title'이면 제외
+      const variantTitle = v.title !== 'Default Title' ? ` - ${v.title}` : '';
+      const itemTitle = `${p.title}${variantTitle}`.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+      const itemId = `shopify_US_${p.id}_${v.id}`;
+      const sku = v.sku || itemId;
+
+      xml += `
+    <item>
+      <g:id>${itemId}</g:id>
+      <g:item_group_id>shopify_US_${p.id}</g:item_group_id>
+      <title>${itemTitle}</title>
+      <description><![CDATA[${desc || itemTitle}]]></description>
+      <link>${productUrl}</link>
+      <g:image_link>${mainImage}</g:image_link>
+      ${adImage && adImage !== mainImage ? `<g:additional_image_link>${adImage}</g:additional_image_link>` : ''}
+      <g:price>${parseFloat(v.price).toFixed(2)} USD</g:price>
+      <g:availability>${availability}</g:availability>
+      <g:condition>new</g:condition>
+      <g:brand>${brand.replace(/&/g, '&amp;')}</g:brand>
+      <g:google_product_category>${googleCategory}</g:google_product_category>
+      <g:identifier_exists>no</g:identifier_exists>
+      <g:mpn>${sku}</g:mpn>
+      <g:shipping>
+        <g:country>US</g:country>
+        <g:service>Standard</g:service>
+        <g:price>8.99 USD</g:price>
+      </g:shipping>
+    </item>`;
+    }
+  }
+
+  xml += `
+  </channel>
+</rss>`;
+
+  return xml;
+}
+
 // ─── 라우트 ─────────────────────────────────────────────
 
 // Health check
@@ -388,8 +484,66 @@ app.get('/', (req, res) => {
     logic: 'Auto-generates product description + Facebook ad image (DALL-E). Original product images untouched.',
     openai: process.env.OPENAI_API_KEY ? 'set' : 'missing',
     shopify: SHOPIFY_STORE || 'missing',
+    catalog_feed: `https://${process.env.RAILWAY_STATIC_URL || 'shopify-shipping-webhook-production.up.railway.app'}/catalog.xml`,
     time: new Date().toISOString()
   });
+});
+
+// ─── Facebook/Instagram 카탈로그 피드 엔드포인트 ─────────
+// GET /catalog.xml  — Meta Business Manager에 등록할 제품 피드
+let catalogCache = { xml: null, generatedAt: 0 };
+const CACHE_TTL_MS = 60 * 60 * 1000; // 1시간 캐시
+
+app.get('/catalog.xml', async (req, res) => {
+  const now = Date.now();
+  const forceRefresh = req.query.refresh === '1';
+
+  if (!forceRefresh && catalogCache.xml && (now - catalogCache.generatedAt) < CACHE_TTL_MS) {
+    console.log('[Catalog] Serving cached feed');
+  } else {
+    console.log('[Catalog] Generating fresh feed from Shopify...');
+    try {
+      catalogCache.xml = await buildFacebookCatalogFeed();
+      catalogCache.generatedAt = now;
+      console.log('[Catalog] ✅ Feed generated');
+    } catch (err) {
+      console.error('[Catalog] Error:', err.message);
+      return res.status(500).send('Feed generation failed');
+    }
+  }
+
+  res.setHeader('Content-Type', 'application/rss+xml; charset=UTF-8');
+  res.setHeader('Cache-Control', 'public, max-age=3600');
+  res.send(catalogCache.xml);
+});
+
+// GET /catalog.json  — JSON 형식 피드 (선택적)
+app.get('/catalog.json', async (req, res) => {
+  const r = await fetch(
+    `https://${SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=250&status=active`,
+    { headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN } }
+  );
+  const { products } = await r.json();
+
+  const items = [];
+  for (const p of products) {
+    if (p.tags?.includes('shipping-fee-hidden') || p.handle === 'shipping-fee') continue;
+    for (const v of p.variants) {
+      const inStock = v.inventory_policy === 'continue' || (v.inventory_quantity ?? 0) > 0;
+      items.push({
+        id: `shopify_US_${p.id}_${v.id}`,
+        title: p.title + (v.title !== 'Default Title' ? ` - ${v.title}` : ''),
+        description: (p.body_html || '').replace(/<[^>]*>/g, '').trim().substring(0, 1000),
+        availability: inStock ? 'in stock' : 'out of stock',
+        condition: 'new',
+        price: `${parseFloat(v.price).toFixed(2)} USD`,
+        link: `https://sojudad.com/products/${p.handle}`,
+        image_link: p.images?.[0]?.src || '',
+        brand: p.vendor || 'Korean Brand',
+      });
+    }
+  }
+  res.json({ data: items });
 });
 
 // 제품 생성 웹훅
@@ -398,6 +552,9 @@ app.post('/webhook/product-create', async (req, res) => {
   const product = req.body;
   if (!product?.id) return;
   await processProduct(product);
+  // 카탈로그 캐시 무효화 (새 제품이 피드에 즉시 반영)
+  catalogCache = { xml: null, generatedAt: 0 };
+  console.log('[Catalog] Cache invalidated after product-create');
 });
 
 // 제품 업데이트 웹훅
@@ -405,6 +562,8 @@ app.post('/webhook/product-update', async (req, res) => {
   res.sendStatus(200);
   const product = req.body;
   if (!product?.id) return;
+  // 카탈로그 캐시 무효화 (가격/재고 변경 즉시 반영)
+  catalogCache = { xml: null, generatedAt: 0 };
   const existing = (product.body_html || '').replace(/<[^>]*>/g, '').trim();
   if (existing.length > 150) return;
   await processProduct(product);
@@ -445,7 +604,8 @@ app.listen(PORT, () => {
   console.log(`   Store  : ${SHOPIFY_STORE}`);
   console.log(`   OpenAI : ${process.env.OPENAI_API_KEY ? '✅ configured' : '❌ MISSING'}`);
   console.log(`   Model  : ${MODEL}`);
-  console.log(`   FB Image: DALL-E 3 (no canvas dependency)\n`);
+  console.log(`   FB Image: DALL-E 3 (no canvas dependency)`);
+  console.log(`   Catalog : /catalog.xml (Meta Business Manager용 피드)\n`);
 });
 
 export default app;
