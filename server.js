@@ -402,7 +402,7 @@ async function buildFacebookCatalogFeed() {
     } catch {}
   }
 
-  const storeUrl = `https://${SHOPIFY_STORE.replace('.myshopify.com', '')}.com`;
+  const storeUrl = process.env.STORE_DOMAIN ? `https://${process.env.STORE_DOMAIN}` : `https://sojudad.com`;
 
   // XML 피드 생성 (Meta Commerce / Google Merchant 호환)
   let xml = `<?xml version="1.0" encoding="UTF-8"?>
