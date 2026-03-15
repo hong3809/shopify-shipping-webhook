@@ -144,7 +144,17 @@ Rules:
       max_tokens: 900,
       temperature: 0.7
     });
-    return res.choices[0].message.content.trim();
+    let content = res.choices[0].message.content.trim();
+
+    // ─── 마크다운 코드블록 자동 제거 ───────────────────────
+    // OpenAI가 ```html ... ``` 형식으로 감싸서 반환하는 경우 제거
+    content = content.replace(/^```html\s*\n?/i, '');
+    content = content.replace(/\n?```\s*$/i, '');
+    content = content.replace(/```html\s*\n?/gi, '');
+    content = content.replace(/\n?```/g, '');
+    content = content.trim();
+
+    return content;
   } catch (err) {
     console.error('[OpenAI] Description error:', err.message);
     return null;
@@ -152,7 +162,6 @@ Rules:
 }
 
 // ─── Facebook 광고 이미지 프롬프트 생성 ─────────────────
-// DALL-E 대신 OpenAI Image API로 생성 (canvas 불필요)
 async function generateFacebookImageUrl(product) {
   try {
     const category = detectCategory(product);
@@ -206,16 +215,12 @@ async function generateFacebookImageUrl(product) {
 // ─── DALL-E 이미지를 Shopify CDN에 영구 업로드 ──────────
 async function uploadImageToShopifyCDN(imageUrl, filename) {
   try {
-    // 1. DALL-E URL에서 이미지 바이너리 다운로드
     const imgRes = await fetch(imageUrl);
     if (!imgRes.ok) throw new Error(`Image fetch failed: ${imgRes.status}`);
     const buffer = await imgRes.buffer();
     const base64 = buffer.toString('base64');
 
-    // 2. Shopify Product Images API로 업로드 (base64)
-    // product images 대신 files API 사용
     const uploadUrl = `https://${SHOPIFY_STORE}/admin/api/2024-01/themes/147194871969/assets.json`;
-    // Shopify Files API (GraphQL)로 업로드
     const graphqlUrl = `https://${SHOPIFY_STORE}/admin/api/2024-01/graphql.json`;
     const mutation = `
       mutation fileCreate($files: [FileCreateInput!]!) {
@@ -252,23 +257,20 @@ async function uploadImageToShopifyCDN(imageUrl, filename) {
       console.log(`[FB Image] ✅ Uploaded to Shopify CDN: ${cdnUrl.substring(0, 60)}...`);
       return cdnUrl;
     }
-    // GraphQL 실패 시 원본 URL 반환
     console.warn('[FB Image] CDN upload failed, using original URL');
     return imageUrl;
   } catch (err) {
     console.error('[FB Image] CDN upload error:', err.message);
-    return imageUrl; // 실패해도 원본 URL 저장
+    return imageUrl;
   }
 }
 
 // ─── Shopify: FB 이미지 URL을 metafield에 저장 ──────────
 async function saveFacebookImageUrl(productId, imageUrl) {
   try {
-    // DALL-E 임시 URL → Shopify CDN 영구 URL로 변환
     console.log(`[FB Image] Uploading to Shopify CDN...`);
     const permanentUrl = await uploadImageToShopifyCDN(imageUrl, `fb_ad_${productId}.png`);
 
-    // 기존 메타필드 확인 (중복 생성 방지)
     const listUrl = `https://${SHOPIFY_STORE}/admin/api/2024-01/products/${productId}/metafields.json`;
     const listRes = await fetch(listUrl, {
       headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN }
@@ -278,12 +280,10 @@ async function saveFacebookImageUrl(productId, imageUrl) {
 
     let url, method, body;
     if (existing) {
-      // 기존 메타필드 업데이트
       url = `https://${SHOPIFY_STORE}/admin/api/2024-01/metafields/${existing.id}.json`;
       method = 'PUT';
       body = JSON.stringify({ metafield: { id: existing.id, value: permanentUrl } });
     } else {
-      // 새 메타필드 생성
       url = listUrl;
       method = 'POST';
       body = JSON.stringify({
@@ -345,7 +345,6 @@ async function processProduct(product) {
   const id = product.id;
   console.log(`\n[Process] 🚀 Starting: ${id} — ${title}`);
 
-  // 1. 제품 설명 생성 (설명이 없거나 짧은 경우만)
   const existing = (product.body_html || '').replace(/<[^>]*>/g, '').trim();
   let newDescription = null;
 
@@ -359,14 +358,12 @@ async function processProduct(product) {
     console.log(`[OpenAI] Description exists (${existing.length} chars), skipping`);
   }
 
-  // 2. Facebook 광고 이미지 생성
   console.log(`[FB Image] Generating Facebook ad image...`);
   const fbImageUrl = await generateFacebookImageUrl(product);
   if (fbImageUrl) {
     await saveFacebookImageUrl(id, fbImageUrl);
   }
 
-  // 3. Shopify 제품 설명 업데이트 (이미지는 건드리지 않음)
   if (newDescription) {
     const ok = await updateShopifyProduct(id, { body_html: newDescription });
     console.log(ok
@@ -380,14 +377,12 @@ async function processProduct(product) {
 
 // ─── Facebook/Instagram 카탈로그 피드 생성 ──────────────
 async function buildFacebookCatalogFeed() {
-  // Shopify에서 전체 활성 제품 가져오기 (Shipping Fee 제외)
   const r = await fetch(
     `https://${SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=250&status=active`,
     { headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN } }
   );
   const { products } = await r.json();
 
-  // 각 제품의 FB 이미지 metafield 가져오기
   const metaMap = {};
   for (const p of products) {
     if (p.tags?.includes('shipping-fee-hidden')) continue;
@@ -404,7 +399,6 @@ async function buildFacebookCatalogFeed() {
 
   const storeUrl = process.env.STORE_DOMAIN ? `https://${process.env.STORE_DOMAIN}` : `https://sojudad.com`;
 
-  // XML 피드 생성 (Meta Commerce / Google Merchant 호환)
   let xml = `<?xml version="1.0" encoding="UTF-8"?>
 <rss version="2.0" xmlns:g="http://base.google.com/ns/1.0">
   <channel>
@@ -414,10 +408,17 @@ async function buildFacebookCatalogFeed() {
 `;
 
   for (const p of products) {
-    // Shipping Fee 제품 제외
-    if (p.tags?.includes('shipping-fee-hidden') || p.handle === 'shipping-fee') continue;
+    // Shipping Fee 제품 제외 (태그 또는 handle 또는 title 기반)
+    if (
+      p.tags?.includes('shipping-fee-hidden') ||
+      p.handle === 'shipping-fee' ||
+      /^shipping\s*fee$/i.test((p.title || '').trim())
+    ) continue;
 
-    const desc = (p.body_html || '').replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().substring(0, 5000);
+    // HTML 태그 제거 + 마크다운 코드블록 제거 후 텍스트 정리
+    let rawDesc = (p.body_html || '');
+    rawDesc = rawDesc.replace(/```html\s*\n?/gi, '').replace(/\n?```/g, '');
+    const desc = rawDesc.replace(/<[^>]*>/g, '').replace(/\s+/g, ' ').trim().substring(0, 5000);
     const fbImageUrl = metaMap[p.id];
 
     for (const v of p.variants) {
@@ -425,18 +426,15 @@ async function buildFacebookCatalogFeed() {
       const mainImage = p.images?.[0]?.src || '';
       const adImage = fbImageUrl || mainImage;
 
-      // 재고 상태 판단
       const inStock = v.inventory_policy === 'continue' || (v.inventory_quantity ?? 0) > 0;
       const availability = inStock ? 'in stock' : 'out of stock';
 
-      // 브랜드 / 카테고리
       const brand = p.vendor || 'Korean Brand';
       const category = detectCategory(p);
       const googleCategory = category === 'kpop'
         ? 'Media > Music > Music CDs & LPs'
         : 'Health & Beauty > Personal Care > Cosmetics';
 
-      // variant title이 'Default Title'이면 제외
       const variantTitle = v.title !== 'Default Title' ? ` - ${v.title}` : '';
       const itemTitle = `${p.title}${variantTitle}`.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
       const itemId = `shopify_US_${p.id}_${v.id}`;
@@ -476,7 +474,6 @@ async function buildFacebookCatalogFeed() {
 
 // ─── 라우트 ─────────────────────────────────────────────
 
-// Health check
 app.get('/', (req, res) => {
   res.json({
     status: 'ok',
@@ -489,10 +486,8 @@ app.get('/', (req, res) => {
   });
 });
 
-// ─── Facebook/Instagram 카탈로그 피드 엔드포인트 ─────────
-// GET /catalog.xml  — Meta Business Manager에 등록할 제품 피드
 let catalogCache = { xml: null, generatedAt: 0 };
-const CACHE_TTL_MS = 60 * 60 * 1000; // 1시간 캐시
+const CACHE_TTL_MS = 60 * 60 * 1000;
 
 app.get('/catalog.xml', async (req, res) => {
   const now = Date.now();
@@ -517,7 +512,6 @@ app.get('/catalog.xml', async (req, res) => {
   res.send(catalogCache.xml);
 });
 
-// GET /catalog.json  — JSON 형식 피드 (선택적)
 app.get('/catalog.json', async (req, res) => {
   const r = await fetch(
     `https://${SHOPIFY_STORE}/admin/api/2024-01/products.json?limit=250&status=active`,
@@ -548,11 +542,10 @@ app.get('/catalog.json', async (req, res) => {
 
 // 제품 생성 웹훅
 app.post('/webhook/product-create', async (req, res) => {
-  res.sendStatus(200); // Shopify 타임아웃 방지 — 즉시 응답
+  res.sendStatus(200);
   const product = req.body;
   if (!product?.id) return;
   await processProduct(product);
-  // 카탈로그 캐시 무효화 (새 제품이 피드에 즉시 반영)
   catalogCache = { xml: null, generatedAt: 0 };
   console.log('[Catalog] Cache invalidated after product-create');
 });
@@ -562,7 +555,6 @@ app.post('/webhook/product-update', async (req, res) => {
   res.sendStatus(200);
   const product = req.body;
   if (!product?.id) return;
-  // 카탈로그 캐시 무효화 (가격/재고 변경 즉시 반영)
   catalogCache = { xml: null, generatedAt: 0 };
   const existing = (product.body_html || '').replace(/<[^>]*>/g, '').trim();
   if (existing.length > 150) return;
@@ -570,7 +562,6 @@ app.post('/webhook/product-update', async (req, res) => {
 });
 
 // 백필: 기존 제품 설명 채우기
-// POST /backfill  { "product_id": "1234567" }  or  { "all": true }
 app.post('/backfill', async (req, res) => {
   const { product_id, all } = req.body || {};
 
