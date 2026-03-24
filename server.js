@@ -340,10 +340,55 @@ async function updateShopifyProduct(productId, updateData) {
 }
 
 // ─── 메인 처리 로직 ─────────────────────────────────────
+
+// ─── 재고 자동 설정 (새 제품 생성 시) ──────────────────
+const LOCATION_ID = 79118565537; // 스토어 위치
+const DEFAULT_INVENTORY_QTY = 10;
+
+async function initInventory(product) {
+  const variants = product.variants || [];
+  for (const v of variants) {
+    const invItemId = v.inventory_item_id;
+    if (!invItemId) continue;
+
+    try {
+      // Step 1: 재고추적 활성화 (inventory_management = 'shopify')
+      await fetch(`https://${SHOPIFY_STORE}/admin/api/2024-01/variants/${v.id}.json`, {
+        method: 'PUT',
+        headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ variant: { id: v.id, inventory_management: 'shopify' } })
+      });
+
+      // Step 2: 스토어 위치에 재고 연결
+      await fetch(`https://${SHOPIFY_STORE}/admin/api/2024-01/inventory_levels/connect.json`, {
+        method: 'POST',
+        headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ location_id: LOCATION_ID, inventory_item_id: invItemId })
+      });
+
+      // Step 3: 재고 수량 10개로 설정
+      const setResp = await fetch(`https://${SHOPIFY_STORE}/admin/api/2024-01/inventory_levels/set.json`, {
+        method: 'POST',
+        headers: { 'X-Shopify-Access-Token': SHOPIFY_TOKEN, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ location_id: LOCATION_ID, inventory_item_id: invItemId, available: DEFAULT_INVENTORY_QTY })
+      });
+
+      console.log(`[Inventory] ✅ variant ${v.id} → ${DEFAULT_INVENTORY_QTY}개 설정 완료 (HTTP ${setResp.status})`);
+    } catch (err) {
+      console.error(`[Inventory] ❌ variant ${v.id} 실패:`, err.message);
+    }
+
+    await new Promise(r => setTimeout(r, 500)); // 요청 간 간격
+  }
+}
+
 async function processProduct(product) {
   const title = product.title || '';
   const id = product.id;
   console.log(`\n[Process] 🚀 Starting: ${id} — ${title}`);
+
+  // 재고추적 활성화 + 위치 연결 + 재고 10개 자동 설정
+  await initInventory(product);
 
   const existing = (product.body_html || '').replace(/<[^>]*>/g, '').trim();
   let newDescription = null;
